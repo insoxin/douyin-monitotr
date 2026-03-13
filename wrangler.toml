@@ -2,11 +2,11 @@ name = "douyin-monitor"
 main = "src/worker.js"
 compatibility_date = "2025-01-01"
 
-[[r2_buckets]]
-binding = "R2"
-bucket_name = "douyin-monitor"
-
+# Cron 定时任务
 [triggers]
 crons = ["0 0 * * *"]
 
-[vars]
+# R2 存储
+[[r2_buckets]]
+binding = "R2"
+bucket_name = "douyin-monitor"
