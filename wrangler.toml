@@ -1,0 +1,10 @@
+name = "douyin-monitor"
+main = "src/worker.js"
+compatibility_date = "2025-01-01"
+
+[[r2_buckets]]
+binding = "R2"
+bucket_name = "douyin-monitor"
+
+[triggers]
+crons = ["0 0 * * *"]
