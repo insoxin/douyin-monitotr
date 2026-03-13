@@ -7,19 +7,21 @@ export default {
   async fetch(request, env) {
 
     const url = new URL(request.url)
+
     if (url.pathname === "/collect") {
       await collect(env)
-      return new Response("collect ok")
+      return new Response("collect done")
     }
 
     if (url.pathname === "/api/data") {
       return getData(env)
     }
 
-    return new Response(dashboard(), {
-      headers: { "content-type": "text/html;charset=UTF-8" }
+    return new Response(dashboard(),{
+      headers:{ "content-type":"text/html;charset=utf-8" }
     })
   }
+
 }
 
 async function collect(env){
@@ -27,25 +29,36 @@ async function collect(env){
   const sec_uid = env.SEC_UID
 
   if(!sec_uid){
-    return new Response("SEC_UID not set")
-  }
-
-  const api =
-  `https://www.douyin.com/aweme/v1/web/user/profile/other/?sec_user_id=${sec_uid}&device_platform=webapp&aid=6383`
-
-  const resp = await fetch(api,{
-    headers:{
-      "user-agent":"Mozilla/5.0"
-    }
-  })
-
-  const json = await resp.json()
-
-  if(!json.user){
     return
   }
 
-  const u = json.user
+  const url = `https://www.douyin.com/user/${sec_uid}`
+
+  const resp = await fetch(url,{
+    headers:{
+      "user-agent":"Mozilla/5.0",
+      "accept-language":"zh-CN"
+    }
+  })
+
+  const html = await resp.text()
+
+  const match = html.match(/<script id="SIGI_STATE" type="application\\/json">(.*?)<\\/script>/)
+
+  if(!match){
+    console.log("SIGI_STATE not found")
+    return
+  }
+
+  const json = JSON.parse(match[1])
+
+  const userModule = json.UserModule
+
+  const userKey = Object.keys(userModule.users)[0]
+
+  const u = userModule.users[userKey]
+
+  const stats = userModule.stats[userKey]
 
   const data = {
 
@@ -53,19 +66,24 @@ async function collect(env){
 
     nickname:u.nickname,
 
-    followers:u.follower_count,
+    followers:stats.followerCount,
 
-    following:u.following_count,
+    following:stats.followingCount,
 
-    aweme:u.aweme_count,
+    aweme:stats.videoCount,
 
-    likes:u.total_favorited
+    likes:stats.diggCount
 
   }
 
   const key = `history/${data.date}.json`
 
-  await env.R2.put(key,JSON.stringify(data))
+  const exist = await env.R2.get(key)
+
+  if(!exist){
+    await env.R2.put(key,JSON.stringify(data))
+  }
+
 }
 
 async function getData(env){
@@ -97,7 +115,7 @@ async function getData(env){
 
 function dashboard(){
 
-return `
+return \`
 <!DOCTYPE html>
 <html>
 <head>
@@ -113,8 +131,8 @@ return `
 body{
 margin:0;
 background:#0f172a;
-font-family:Inter,Arial;
 color:white;
+font-family:Arial;
 }
 
 .container{
@@ -126,21 +144,7 @@ padding:40px;
 .card{
 background:#1e293b;
 padding:25px;
-border-radius:12px;
-margin-bottom:25px;
-}
-
-.stats{
-display:flex;
-gap:40px;
-flex-wrap:wrap;
-}
-
-.stat{
-font-size:18px;
-}
-
-.range{
+border-radius:10px;
 margin-bottom:20px;
 }
 
@@ -154,12 +158,8 @@ color:white;
 cursor:pointer;
 }
 
-.range button:hover{
-background:#475569;
-}
-
 .chart{
-height:350px;
+height:320px;
 }
 
 </style>
@@ -170,53 +170,25 @@ height:350px;
 
 <div class="container">
 
-<h1>抖音账号数据分析</h1>
-
-<div class="card">
-
-<div class="stats">
-
-<div class="stat">昵称<br><b id="nickname"></b></div>
-
-<div class="stat">粉丝<br><b id="followers"></b></div>
-
-<div class="stat">关注<br><b id="following"></b></div>
-
-<div class="stat">作品<br><b id="aweme"></b></div>
-
-<div class="stat">点赞<br><b id="likes"></b></div>
-
-</div>
-
-</div>
+<h1>抖音账号监控</h1>
 
 <div class="range">
-
 <button onclick="setRange(7)">7天</button>
 <button onclick="setRange(30)">30天</button>
 <button onclick="setRange(90)">90天</button>
 <button onclick="setRange(365)">1年</button>
 <button onclick="setRange(9999)">全部</button>
-
 </div>
 
 <div class="card">
-<h2>粉丝趋势</h2>
 <div id="followersChart" class="chart"></div>
 </div>
 
 <div class="card">
-<h2>日新增粉丝</h2>
-<div id="growthChart" class="chart"></div>
-</div>
-
-<div class="card">
-<h2>点赞趋势</h2>
 <div id="likesChart" class="chart"></div>
 </div>
 
 <div class="card">
-<h2>作品数量趋势</h2>
 <div id="awemeChart" class="chart"></div>
 </div>
 
@@ -233,10 +205,6 @@ const resp=await fetch("/api/data")
 
 raw=await resp.json()
 
-if(raw.length===0)return
-
-updateStats()
-
 render()
 
 }
@@ -244,20 +212,7 @@ render()
 function setRange(r){
 
 range=r
-
 render()
-
-}
-
-function updateStats(){
-
-const last=raw[raw.length-1]
-
-document.getElementById("nickname").innerText=last.nickname
-document.getElementById("followers").innerText=last.followers
-document.getElementById("following").innerText=last.following
-document.getElementById("aweme").innerText=last.aweme
-document.getElementById("likes").innerText=last.likes
 
 }
 
@@ -270,30 +225,17 @@ data=data.slice(-range)
 }
 
 const dates=data.map(i=>i.date)
-
 const followers=data.map(i=>i.followers)
-
 const likes=data.map(i=>i.likes)
-
 const aweme=data.map(i=>i.aweme)
 
-const growth=[]
-
-for(let i=1;i<data.length;i++){
-growth.push(data[i].followers-data[i-1].followers)
-}
-
-drawChart("followersChart",dates,followers)
-
-drawChart("likesChart",dates,likes)
-
-drawChart("awemeChart",dates,aweme)
-
-drawChart("growthChart",dates.slice(1),growth)
+draw("followersChart","粉丝",dates,followers)
+draw("likesChart","点赞",dates,likes)
+draw("awemeChart","作品",dates,aweme)
 
 }
 
-function drawChart(id,x,data){
+function draw(id,name,x,data){
 
 const chart=echarts.init(document.getElementById(id))
 
@@ -306,10 +248,10 @@ xAxis:{type:"category",data:x},
 yAxis:{type:"value"},
 
 series:[{
-data:data,
+name:name,
 type:"line",
 smooth:true,
-areaStyle:{}
+data:data
 }]
 
 })
@@ -323,5 +265,5 @@ load()
 </body>
 
 </html>
-`
+\`
 }
