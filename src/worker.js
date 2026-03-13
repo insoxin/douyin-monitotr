@@ -453,6 +453,7 @@ async function load() {
 }
 
 // 渲染历史资料变更表
+// 渲染历史资料变更表（限制最多显示 5 条）
 function renderHistoryTable() {
     const tbody = document.getElementById("historyTbody");
     tbody.innerHTML = "";
@@ -461,20 +462,25 @@ function renderHistoryTable() {
     
     let html = "";
     let prev = null;
+    let count = 0; // 新增：记录当前显示的条数
+    const MAX_ROWS = 5; // 新增：你可以自己修改这个数字，决定最多显示几行
     
-    reversed.forEach(item => {
-        // 只有当昵称、签名或头像发生变化时，才在表格中显示一条记录（避免每天重复相同的数据）
+    for (const item of reversed) {
+        if (count >= MAX_ROWS) break; // 如果超过限制，就停止渲染
+        
+        // 只有当昵称、签名或头像发生变化时，才在表格中显示一条记录
         if (!prev || prev.nickname !== item.nickname || prev.signature !== item.signature || prev.avatar !== item.avatar) {
-            html += \`
+            html += `
             <tr style="border-bottom: 1px solid #334155;">
-                <td style="padding: 12px 8px; color: #94a3b8; white-space: nowrap;">\${item.date}</td>
-                <td style="padding: 12px 8px;"><img src="\${item.avatar || ''}" style="width: 36px; height: 36px; border-radius: 50%; object-fit: cover; border: 1px solid var(--border);"></td>
-                <td style="padding: 12px 8px; font-weight: 500;">\${item.nickname || '-'}</td>
-                <td style="padding: 12px 8px; max-width: 300px; color: #cbd5e1;">\${(item.signature || '-').replace(/\\n/g, '<br>')}</td>
-            </tr>\`;
+                <td style="padding: 12px 8px; color: #94a3b8; white-space: nowrap;">${item.date}</td>
+                <td style="padding: 12px 8px;"><img src="${item.avatar || ''}" style="width: 36px; height: 36px; border-radius: 50%; object-fit: cover; border: 1px solid var(--border);"></td>
+                <td style="padding: 12px 8px; font-weight: 500;">${item.nickname || '-'}</td>
+                <td style="padding: 12px 8px; max-width: 300px; color: #cbd5e1;">${(item.signature || '-').replace(/\n/g, '<br>')}</td>
+            </tr>`;
             prev = item;
+            count++; // 新增：成功渲染一行，计数器+1
         }
-    });
+    }
     tbody.innerHTML = html;
 }
 
