@@ -265,7 +265,7 @@ return `<!DOCTYPE html>
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 
-<script src="https://cdn.jsdelivr.net/npm/echarts@5"></script>
+<script src="https://registry.npmmirror.com/echarts/5.5.0/files/dist/echarts.min.js"></script>
 <style>
 :root {
     --bg: #0f172a; --panel: #1e293b; --text-main: #f8fafc; --text-muted: #94a3b8;
