@@ -29,8 +29,15 @@ export default {
    return collect(env) 
   }
 
+  // 增加强制重建缓存的后门路由
+  if (url.pathname === "/api/build") {
+   await buildCache(env)
+   return new Response("Cache Rebuilt Success")
+  }
+
+  // API 路由现在接收 request 参数以处理 ?days=30 按需加载
   if (url.pathname === "/api/data") {
-   return getData(env)
+   return getData(request, env)
   }
 
   if (url.pathname === "/debug") {
@@ -48,7 +55,7 @@ export default {
 // ==== 身份验证逻辑 (Cookie版) ====
 function checkAuthCookie(request, env) {
   const cookie = request.headers.get("Cookie") || "";
-  const expectedPass = env.ADMIN_PASS || "123456"; // 现在只需要密码
+  const expectedPass = env.ADMIN_PASS || "123456"; 
   return cookie.includes(`auth=${expectedPass}`);
 }
 
@@ -62,7 +69,6 @@ async function handleLogin(request, env) {
           status: 302,
           headers: {
               "Location": "/",
-              // 设置 30 天免登录 Cookie
               "Set-Cookie": `auth=${pass}; HttpOnly; Path=/; Max-Age=2592000; SameSite=Strict`
           }
       });
@@ -106,9 +112,7 @@ function loginPage(errorMsg = "") {
 }
 
 async function douyinRequest(sec_uid){
-
  const api = `https://www.iesdouyin.com/web/api/v2/user/info/?sec_uid=${sec_uid}&aid=6383`
-
  const resp = await fetch(api,{
   headers:{
    "accept":"application/json, text/plain, */*",
@@ -117,10 +121,26 @@ async function douyinRequest(sec_uid){
    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
   }
  })
-
  const buffer = await resp.arrayBuffer()
- const text = new TextDecoder("utf-8").decode(buffer)
- return text
+ return new TextDecoder("utf-8").decode(buffer)
+}
+
+// ==== 数据读写分离缓存构建逻辑 ====
+async function buildCache(env) {
+  if(!env.R2) return [];
+  const list = await env.R2.list({ prefix: "history/" });
+  const arr = [];
+  for (const obj of list.objects) {
+    if (obj.key === 'history/all.json') continue;
+    const file = await env.R2.get(obj.key);
+    if(file) arr.push(await file.json());
+  }
+  arr.sort((a, b) => a.date.localeCompare(b.date));
+  
+  if (arr.length > 0) {
+    await env.R2.put('history/all.json', JSON.stringify(arr));
+  }
+  return arr;
 }
 
 async function collect(env, debug=false){
@@ -141,8 +161,6 @@ async function collect(env, debug=false){
   }
 
   const u = json.user_info
-
-  // 修复时区问题：强制使用 UTC+8 (北京时间) 作为日期切割标准
   const beijingTime = new Date(Date.now() + 8 * 3600 * 1000)
   const dateStr = beijingTime.toISOString().slice(0, 10)
 
@@ -160,32 +178,12 @@ async function collect(env, debug=false){
 
   if(!env.R2) return new Response("Worker 环境变量错误：没有找到 env.R2", { status: 500 })
 
-  // 1. 保存当天的独立文件 (作为冗余备份)
+  // 【优化3】：彻底解决文件读写锁竞争。collect 阶段只原子的写入当天的独立文件
   const dailyKey = `history/${data.date}.json`
   await env.R2.put(dailyKey, JSON.stringify(data))
 
-  // 2. 核心性能优化：更新合并文件 all.json
-  let allData = []
-  const allExist = await env.R2.get('history/all.json')
-  
-  if (allExist) {
-    allData = await allExist.json()
-  } else {
-    // 如果 all.json 不存在，说明是刚升级，先遍历一次历史文件进行无缝迁移
-    const list = await env.R2.list({ prefix: "history/" })
-    for(const obj of list.objects){
-      if(obj.key === 'history/all.json') continue;
-      const file = await env.R2.get(obj.key)
-      allData.push(await file.json())
-    }
-  }
-
-  // 剔除当天可能已存在的旧数据（防止一天内多次触发导致重复），再压入最新数据
-  allData = allData.filter(d => d.date !== data.date)
-  allData.push(data)
-  allData.sort((a,b) => a.date.localeCompare(b.date))
-
-  await env.R2.put('history/all.json', JSON.stringify(allData))
+  // 然后调用后台路由，遍历所有独立文件重建视图缓存，确保 all.json 数据百分百准确
+  await buildCache(env)
 
   return new Response("collect ok")
 
@@ -194,34 +192,29 @@ async function collect(env, debug=false){
  }
 }
 
-async function getData(env){
-  // 优先尝试直接读取合并好的全量文件，实现 O(1) 极速响应
+async function getData(request, env){
+  // 【优化5】：按需加载。提取天数范围，默认请求30天
+  const url = new URL(request.url);
+  const daysStr = url.searchParams.get("days") || "30";
+  const days = parseInt(daysStr, 10);
+
   const allFile = await env.R2.get("history/all.json")
+  let arr = [];
   
   if (allFile) {
-    return new Response(allFile.body, {
-      headers: {
-        "content-type": "application/json; charset=utf-8",
-        "Access-Control-Allow-Origin": "*"
-      }
-    })
+    arr = await allFile.json()
+  } else {
+    // 缓存丢失则即刻重建
+    arr = await buildCache(env)
   }
 
-  // 如果 all.json 还没生成（比如直接访问网页但没触发过 collect），则走降级遍历逻辑并生成
-  const list = await env.R2.list({ prefix:"history/" })
-  const arr=[]
-  for(const obj of list.objects){
-    if(obj.key === 'history/all.json') continue;
-    const file = await env.R2.get(obj.key)
-    arr.push(await file.json())
-  }
-  arr.sort((a,b)=>a.date.localeCompare(b.date))
-  
-  if (arr.length > 0) {
-    await env.R2.put("history/all.json", JSON.stringify(arr))
+  // 服务端完成数据切割以节省带宽
+  let resData = arr;
+  if (days !== 9999 && arr.length > days) {
+      resData = arr.slice(-days);
   }
 
-  return new Response(JSON.stringify(arr),{
+  return new Response(JSON.stringify(resData),{
    headers:{ "content-type":"application/json; charset=utf-8", "Access-Control-Allow-Origin":"*" }
   })
 }
@@ -232,25 +225,28 @@ async function debug(env){
 }
 
 async function getManifest(env) {
- let avatarUrl = "https://ui-avatars.com/api/?name=DY&background=3b82f6&color=fff&size=192"; // 默认兜底图标
+ let avatarUrl = "https://ui-avatars.com/api/?name=DY&background=3b82f6&color=fff&size=192"; 
+ let appName = "数据中心"; // 默认名字
 
- // 尝试从 R2 读取最新数据获取头像
  try {
    if (env && env.R2) {
      const allFile = await env.R2.get("history/all.json");
      if (allFile) {
        const allData = await allFile.json();
-       if (allData.length > 0 && allData[allData.length - 1].avatar) {
-         avatarUrl = allData[allData.length - 1].avatar;
+       if (allData.length > 0) {
+           const last = allData[allData.length - 1];
+           if (last.avatar) avatarUrl = last.avatar;
+           // 【更新】：将用户的昵称用作 PWA 的 App 名字
+           if (last.nickname) appName = last.nickname;
        }
      }
    }
  } catch (e) {
-   console.error("获取头像作为PWA图标失败", e);
+   console.error("动态获取PWA信息失败", e);
  }
 
  const manifest = {
-  name: "数据中心", short_name: "数据中心", start_url: "/", display: "standalone",
+  name: appName, short_name: appName, start_url: "/", display: "standalone",
   background_color: "#0f172a", theme_color: "#0f172a", description: "个人抖音账号数据追踪面板",
   icons: [
    { src: avatarUrl, sizes: "192x192", type: "image/png" },
@@ -260,10 +256,41 @@ async function getManifest(env) {
  return new Response(JSON.stringify(manifest), { headers: { "content-type": "application/json; charset=utf-8" } })
 }
 
+// 【优化2】：增强型 Service Worker，支持静态资源离线缓存
 function getServiceWorker() {
  const sw = `
-  self.addEventListener('install', (e) => { self.skipWaiting(); });
-  self.addEventListener('fetch', (e) => { e.respondWith(fetch(e.request).catch(() => new Response("网络连接已断开"))); });
+  const CACHE_NAME = 'dy-monitor-v2';
+  const ASSETS = [
+      '/',
+      '/manifest.json',
+      'https://registry.npmmirror.com/echarts/5.5.0/files/dist/echarts.min.js'
+  ];
+
+  self.addEventListener('install', (e) => { 
+      e.waitUntil(caches.open(CACHE_NAME).then(c => c.addAll(ASSETS)));
+      self.skipWaiting(); 
+  });
+  
+  self.addEventListener('fetch', (e) => { 
+      const url = new URL(e.request.url);
+      
+      // 核心 API 不走缓存，确保数据实时性
+      if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/collect')) {
+          e.respondWith(fetch(e.request));
+          return;
+      }
+
+      // 静态资源使用 Network First 策略，断网时 fallback 到缓存
+      e.respondWith(
+          fetch(e.request)
+          .then(res => {
+              const resClone = res.clone();
+              caches.open(CACHE_NAME).then(c => c.put(e.request, resClone));
+              return res;
+          })
+          .catch(() => caches.match(e.request).then(cachedRes => cachedRes || new Response("网络连接已断开")))
+      );
+  });
  `
  return new Response(sw, { headers: { "content-type": "application/javascript; charset=utf-8" } })
 }
@@ -296,7 +323,6 @@ body {
 
 .container { max-width: 1200px; margin: 0 auto; }
 
-/* 加载动画幕布 */
 #loading-overlay {
     position: fixed; top: 0; left: 0; width: 100%; height: 100%;
     background: var(--bg); z-index: 9999;
@@ -371,7 +397,7 @@ body {
 
 <div class="container">
     <div class="header" style="display: flex; justify-content: space-between; align-items: center;">
-        <h2>数据中心</h2>
+        <h2 id="app-title">数据中心</h2>
         <div class="control-group">
             <button class="btn btn-export" onclick="exportData('csv')">导出 CSV</button>
             <button class="btn btn-export" onclick="exportData('json')">导出 JSON</button>
@@ -443,6 +469,7 @@ if ('serviceWorker' in navigator) {
 
 let raw = [];
 let currentRange = 30;
+let loadedRange = 0; // 记录目前已经从后端拉取的数据天数
 let currentMetric = 'followers';
 
 const metricNames = {
@@ -450,41 +477,40 @@ const metricNames = {
     likes: '获赞总数', favoriting: '喜欢/点赞数'
 };
 
-async function load() {
+async function load(days) {
+    document.getElementById('loading-overlay').style.display = 'flex';
+    document.getElementById('loading-overlay').style.opacity = '1';
+
     try {
-        const resp = await fetch("/api/data");
+        const resp = await fetch("/api/data?days=" + days);
         raw = await resp.json();
+        loadedRange = days;
         if(raw.length > 0) {
             updateStats();
             render();
-            renderHistoryTable(); // 渲染历史资料表格
+            renderHistoryTable();
         }
     } catch (e) {
         console.error("加载数据失败:", e);
     } finally {
-        // 数据加载完毕后，淡出隐藏加载动画层
         const overlay = document.getElementById('loading-overlay');
         overlay.style.opacity = '0';
         setTimeout(() => overlay.style.display = 'none', 400);
     }
 }
 
-// 渲染历史资料变更表
 function renderHistoryTable() {
     const tbody = document.getElementById("historyTbody");
     tbody.innerHTML = "";
-    // 将数据反转，最新日期排在最前
     const reversed = [...raw].reverse();
     
     let html = "";
     let prev = null;
-    let count = 0; // 新增：记录当前显示的条数
-    const MAX_ROWS = 5; // 新增：你可以自己修改这个数字，决定最多显示几行
+    let count = 0; 
+    const MAX_ROWS = 5; 
     
     for (const item of reversed) {
-        if (count >= MAX_ROWS) break; // 如果超过限制，就停止渲染
-        
-        // 只有当昵称、签名或头像发生变化时，才在表格中显示一条记录
+        if (count >= MAX_ROWS) break; 
         if (!prev || prev.nickname !== item.nickname || prev.signature !== item.signature || prev.avatar !== item.avatar) {
             html += \`
             <tr style="border-bottom: 1px solid #334155;">
@@ -494,7 +520,7 @@ function renderHistoryTable() {
                 <td style="padding: 12px 8px; max-width: 300px; color: #cbd5e1;">\${(item.signature || '-').replace(/\\n/g, '<br>')}</td>
             </tr>\`;
             prev = item;
-            count++; // 新增：成功渲染一行，计数器+1
+            count++;
         }
     }
     tbody.innerHTML = html;
@@ -504,7 +530,13 @@ function setRange(r, btnEl) {
     currentRange = r;
     document.querySelectorAll('.r-btn').forEach(btn => btn.classList.remove('active'));
     if(btnEl) btnEl.classList.add('active');
-    render();
+
+    // 【优化5】：如果请求的范围大于当前加载的范围，才去服务器拿新数据
+    if (currentRange > loadedRange) {
+        load(currentRange);
+    } else {
+        render(); // 本地数据直接截取重绘
+    }
 }
 
 function setMetric(m, btnEl) {
@@ -519,11 +551,14 @@ function updateStats() {
 
     document.getElementById("avatar").src = last.avatar || '';
     
-    // 动态替换 iOS 的保存图标
     const appleIcon = document.querySelector('link[rel="apple-touch-icon"]');
     if(appleIcon) appleIcon.href = last.avatar || 'https://ui-avatars.com/api/?name=DY&background=3b82f6&color=fff&size=192';
 
-    document.getElementById("nickname").innerText = last.nickname || '未知';
+    const nickNameText = last.nickname || '未知';
+    document.getElementById("nickname").innerText = nickNameText;
+    document.title = nickNameText + "的面板"; // 更新页面 Title
+    document.getElementById("app-title").innerText = nickNameText + "的数据"; // 更新页面顶栏
+    
     document.getElementById("signature").innerText = last.signature || '暂无签名';
     
     document.getElementById("followers").innerText = format(last.followers);
@@ -543,7 +578,9 @@ function updateStats() {
 
 function render() {
     let data = [...raw];
-    if (currentRange !== 9999) data = data.slice(-currentRange);
+    if (currentRange !== 9999 && data.length > currentRange) {
+        data = data.slice(-currentRange);
+    }
 
     const dates = data.map(i => i.date);
     const metricData = data.map(i => i[currentMetric]);
@@ -566,7 +603,8 @@ function drawChart(id, xData, yData, title, colorStr) {
 
     chart.setOption({
         title: { text: title, textStyle: { color: '#e2e8f0', fontSize: 15, fontWeight: 'normal' } },
-        tooltip: { trigger: 'axis', backgroundColor: 'rgba(30, 41, 59, 0.9)', borderColor: '#334155', textStyle: { color: '#f8fafc' } },
+        // 【优化4】：加入 confine: true，防止 tooltip 在手机端被截断
+        tooltip: { trigger: 'axis', confine: true, backgroundColor: 'rgba(30, 41, 59, 0.9)', borderColor: '#334155', textStyle: { color: '#f8fafc' } },
         grid: { left: '3%', right: '4%', bottom: '3%', containLabel: true },
         xAxis: { type: "category", data: xData, axisLabel: { color: '#94a3b8' }, axisLine: { lineStyle: { color: '#334155' } } },
         yAxis: { type: "value", axisLabel: { color: '#94a3b8' }, splitLine: { lineStyle: { color: '#334155', type: 'dashed' } }, minInterval: 1 },
@@ -589,15 +627,13 @@ function format(n) {
     return n.toLocaleString(); 
 }
 
-// === 导出数据逻辑 ===
 function exportData(type) {
     if(!raw || raw.length === 0) return alert("暂无数据可导出");
     let content, mime, filename;
 
     if (type === 'csv') {
-        content = "\\uFEFF日期,昵称,签名,头像URL,粉丝总数,关注数,作品数,获赞总数,喜欢点赞数\\n"; // \\uFEFF 防止 Excel 中文乱码
+        content = "\\uFEFF日期,昵称,签名,头像URL,粉丝总数,关注数,作品数,获赞总数,喜欢点赞数\\n"; 
         raw.forEach(r => {
-            // 处理昵称和签名中可能包含的逗号或换行，转义成双引号包裹
             const safeNickname = \`"\${(r.nickname || '').replace(/"/g, '""')}"\`;
             const safeSignature = \`"\${(r.signature || '').replace(/"/g, '""').replace(/\\n/g, ' ')}"\`;
             
@@ -620,7 +656,8 @@ function exportData(type) {
     document.body.removeChild(link);
 }
 
-load();
+// 初始化时默认加载 30 天的数据
+load(30);
 </script>
 </body>
 </html>`
